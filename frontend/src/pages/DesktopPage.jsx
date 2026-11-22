@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { Download, KeyRound, Monitor, OctagonX, Send, Trash2 } from "lucide-react";
+import DesktopTaskCard from "@/components/adam/DesktopTaskCard";
 import { toast } from "sonner";
 import { BACKEND_URL, errMsg, useApi } from "@/lib/api";
 import PageHeader from "@/components/adam/PageHeader";
 
 const card = "p-5 rounded-xl bg-[#2A2A2A] border border-white/[0.07]";
-const STATUS = { queued: "Na fila", running: "Executando", done: "Concluída", stopped: "Parada", error: "Erro" };
 const STEPS = [
-  <>Baixe o <code className="text-zinc-100">adam-desktop.zip</code> e extraia em uma pasta.</>,
-  <>Windows: dois cliques em <b>Iniciar-Adam.bat</b>. macOS/Linux: rode <code className="text-zinc-100">./iniciar.sh</code>.</>,
+  <>Windows: baixe e rode o <b>AdamSetup.exe</b> (não precisa de Python). Um atalho <b>Adam Desktop</b> aparece na Área de Trabalho.</>,
+  <>macOS/Linux: baixe o <code className="text-zinc-100">.zip</code>, extraia e rode <code className="text-zinc-100">./iniciar.sh</code>.</>,
   <>Clique em <b>Gerar código</b> abaixo e digite o código no programa.</>,
   <>Mande uma tarefa. O programa pede sua permissão antes de cada ação e registra tudo em <code className="text-zinc-100">adam_log.txt</code>.</>,
 ];
@@ -30,23 +30,22 @@ function Pairing({ api, onChange }) {
   );
 }
 
-function TaskLog({ t, onStop }) {
-  const live = t.status === "queued" || t.status === "running";
+const TRUSTABLE = [["abrir_site", "Abrir sites"], ["abrir", "Abrir programas"], ["rolar", "Rolar"], ["mover_mouse", "Mover mouse"],
+  ["clicar", "Clicar"], ["digitar", "Digitar"], ["tecla", "Atalhos"]];
+
+function Trusted({ api, d, onChange }) {
+  const cur = d.trusted || [];
+  const toggle = async (k) => {
+    const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k];
+    try { await api.put(`/desktop/devices/${d.id}/trusted`, { actions: next }); onChange(); } catch (e) { toast.error(errMsg(e)); }
+  };
   return (
-    <div className={card} data-testid={`desktop-task-${t.id}`}>
-      <div className="flex items-start gap-3 mb-3">
-        <p className="flex-1 text-sm">{t.task}</p>
-        <span className={`text-xs px-2 py-0.5 rounded ${live ? "bg-amber-500/15 text-amber-300" : "bg-white/5 text-zinc-400"}`} data-testid={`desktop-task-status-${t.id}`}>{STATUS[t.status] || t.status}</span>
-        {live && <button onClick={() => onStop(t.id)} data-testid={`desktop-task-stop-${t.id}`} className="text-xs px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 hover:bg-rose-500/30">Parar</button>}
-      </div>
-      <div className="space-y-1 max-h-56 overflow-y-auto scroll-thin text-xs font-mono text-zinc-400">
-        {t.logs.slice(1).map((l, i) => (
-          <p key={i} className={l.kind === "adam" || l.kind === "done" ? "text-zinc-200" : l.kind === "error" ? "text-rose-300" : ""}>
-            <span className="text-zinc-600">{new Date(l.t).toLocaleTimeString()} </span>{l.text}
-          </p>
-        ))}
-        {live && <p className="text-zinc-500">Aguardando o computador…</p>}
-      </div>
+    <div className="flex flex-wrap gap-1.5 mt-2" data-testid={`desktop-trusted-${d.id}`}>
+      <span className="text-[11px] text-zinc-500 w-full">Sem pedir permissão (comandos do terminal sempre pedem):</span>
+      {TRUSTABLE.map(([k, l]) => (
+        <button key={k} onClick={() => toggle(k)} data-testid={`desktop-trusted-${d.id}-${k}`}
+          className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors ${cur.includes(k) ? "border-emerald-400/40 bg-emerald-400/15 text-emerald-300" : "border-white/10 text-zinc-400 hover:text-white"}`}>{l}</button>
+      ))}
     </div>
   );
 }
@@ -66,11 +65,11 @@ export default function DesktopPage() {
   }, [api]);
   useEffect(() => { load(); const i = setInterval(load, 2500); return () => clearInterval(i); }, [load]);
 
-  const download = async () => {
+  const download = async (path, name) => {
     try {
-      const r = await api.get("/desktop/download", { params: { server: BACKEND_URL }, responseType: "blob" });
+      const r = await api.get(path, { params: { server: BACKEND_URL }, responseType: "blob" });
       const a = document.createElement("a");
-      a.href = URL.createObjectURL(r.data); a.download = "adam-desktop.zip"; a.click();
+      a.href = URL.createObjectURL(r.data); a.download = name; a.click();
     } catch (e) { toast.error(errMsg(e)); }
   };
   const send = async (e) => {
@@ -78,7 +77,6 @@ export default function DesktopPage() {
     if (!task.trim() || !device) return;
     try { await api.post("/desktop/tasks", { device_id: device, task }); setTask(""); load(); } catch (err) { toast.error(errMsg(err)); }
   };
-  const stop = async (id) => { await api.post(`/desktop/tasks/${id}/stop`).catch(() => {}); load(); };
   const stopAll = async () => { const r = await api.post("/desktop/stop-all"); toast.success(`${r.data.stopped} tarefa(s) parada(s)`); load(); };
   const remove = async (id) => { await api.delete(`/desktop/devices/${id}`).catch((e) => toast.error(errMsg(e))); setDevice(""); load(); };
   const online = (d) => Date.now() - new Date(d.last_seen).getTime() < 20000;
@@ -88,10 +86,16 @@ export default function DesktopPage() {
       <div className="max-w-5xl mx-auto px-5 sm:px-8 py-10">
         <PageHeader eyebrow="Desktop Agent · Windows, macOS, Linux" title="O Adam no seu computador"
           subtitle="Um pequeno programa no seu PC faz a ponte com o Adam: ele vê a tela, usa mouse, teclado, programas e o navegador — sempre pedindo sua permissão antes de cada ação.">
-          <button onClick={download} data-testid="desktop-download-button"
-            className="flex items-center gap-2 px-5 py-3 rounded-xl bg-white text-black text-sm font-medium hover:bg-zinc-200 transition-colors">
-            <Download className="w-4 h-4" /> Baixar Adam Desktop
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => download("/desktop/installer", "AdamSetup.exe")} data-testid="desktop-installer-download-button"
+              className="flex items-center gap-2 px-5 py-3 rounded-xl bg-white text-black text-sm font-medium hover:bg-zinc-200 transition-colors">
+              <Download className="w-4 h-4" /> Baixar para Windows (.exe)
+            </button>
+            <button onClick={() => download("/desktop/download", "adam-desktop.zip")} data-testid="desktop-download-button"
+              className="flex items-center gap-2 px-5 py-3 rounded-xl bg-white/10 text-sm hover:bg-white/15 transition-colors">
+              <Download className="w-4 h-4" /> macOS / Linux (.zip)
+            </button>
+          </div>
         </PageHeader>
         <ol className="grid sm:grid-cols-2 gap-3 mb-8" data-testid="desktop-steps">
           {STEPS.map((s, i) => (
@@ -106,11 +110,14 @@ export default function DesktopPage() {
             <p className="font-display mb-3">Computadores pareados</p>
             {devices.length === 0 && <p className="text-xs text-zinc-500">Nenhum ainda.</p>}
             {devices.map((d) => (
-              <div key={d.id} className="flex items-center gap-3 py-2 border-b border-white/5 last:border-0" data-testid={`desktop-device-${d.id}`}>
+              <div key={d.id} className="py-2 border-b border-white/5 last:border-0" data-testid={`desktop-device-${d.id}`}>
+                <div className="flex items-center gap-3">
                 <Monitor className="w-4 h-4 text-zinc-400" />
                 <div className="flex-1 text-sm">{d.name}<p className="text-xs text-zinc-500">{d.os}</p></div>
                 <span className={`w-2 h-2 rounded-full ${online(d) ? "bg-emerald-400" : "bg-zinc-600"}`} title={online(d) ? "Online" : "Offline"} />
                 <button onClick={() => remove(d.id)} data-testid={`desktop-device-remove-${d.id}`} className="p-1.5 rounded hover:bg-white/10" title="Desconectar"><Trash2 className="w-4 h-4 text-zinc-400" /></button>
+                </div>
+                <Trusted api={api} d={d} onChange={load} />
               </div>
             ))}
           </div>
@@ -131,7 +138,7 @@ export default function DesktopPage() {
           <OctagonX className="w-4 h-4" /> Parar tudo (emergência)
         </button>
         <div className="space-y-3" data-testid="desktop-task-list">
-          {tasks.map((t) => <TaskLog key={t.id} t={t} onStop={stop} />)}
+          {tasks.map((t) => <DesktopTaskCard key={t.id} task={t} compact={!["queued", "running"].includes(t.status)} />)}
         </div>
       </div>
     </div>

@@ -221,8 +221,9 @@ Ferramentas disponíveis:
 - salvar_memoria: quando o usuário contar algo importante e duradouro sobre si, preferências ou projetos.
 - pesquisar_web: para fatos atuais, notícias, preços, documentação ou qualquer coisa que você não tenha certeza. Cite as fontes com links.
 - abrir_site: para ler o conteúdo de uma página (use após pesquisar ou quando o usuário enviar um link).
-- abrir_no_navegador: quando o usuário pedir para abrir/ir para um site no computador dele; abre uma nova aba no navegador do usuário.
-Depois de usar uma ferramenta, comente brevemente o resultado. Nunca insira imagens ou links de arquivos em Markdown: os arquivos e imagens criados já aparecem automaticamente para o usuário com botão de download. Seja honesto sobre limitações: nesta versão você ainda não clica nem digita dentro do navegador do usuário — você lê sites no servidor e abre abas para ele."""
+- abrir_no_navegador: quando o usuário pedir só para abrir/ir para um site; abre uma nova aba no navegador do usuário.
+- controlar_computador: quando o usuário pedir para você FAZER algo no computador dele (clicar, digitar, usar programas, preencher algo no navegador, organizar arquivos, rodar comandos). Envia a tarefa ao Adam Desktop; o usuário aprova cada ação. Depois, diga em uma frase que a tarefa foi enviada e que ele acompanha no cartão.
+Depois de usar uma ferramenta, comente brevemente o resultado. Nunca insira imagens ou links de arquivos em Markdown: os arquivos e imagens criados já aparecem automaticamente para o usuário com botão de download. Com o Adam Desktop instalado e pareado (Extensões → Computador), você controla o computador do usuário via controlar_computador; sem ele, explique como instalar."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -253,13 +254,21 @@ TOOLS = [
         "description": "Acessa uma URL e retorna título, texto e links da página.",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
     {"type": "function", "function": {
+        "name": "controlar_computador",
+        "description": "Envia uma tarefa para o Adam Desktop executar no computador do usuário (mouse, teclado, programas, navegador, terminal). O usuário aprova cada ação no PC.",
+        "parameters": {"type": "object", "properties": {
+            "tarefa": {"type": "string", "description": "Tarefa completa e clara, em português"},
+            "computador": {"type": "string", "description": "Nome do computador, se o usuário tiver mais de um (opcional)"}},
+            "required": ["tarefa"]}}},
+    {"type": "function", "function": {
         "name": "abrir_no_navegador",
         "description": "Abre uma URL em nova aba no navegador do usuário.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"}, "titulo": {"type": "string"}}, "required": ["url"]}}},
 ]
 TOOL_LABELS = {"criar_arquivo": "Criando arquivo", "gerar_imagem": "Gerando imagem", "salvar_memoria": "Salvando na memória",
-               "pesquisar_web": "Pesquisando na web", "abrir_site": "Lendo site", "abrir_no_navegador": "Abrindo no seu navegador"}
+               "pesquisar_web": "Pesquisando na web", "abrir_site": "Lendo site", "abrir_no_navegador": "Abrindo no seu navegador",
+               "controlar_computador": "Enviando para o seu computador"}
 WIDGET_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("pesquisar_web", "abrir_site")]
 WIDGET_PROMPT = """Você é {title}, um assistente baseado no Adam (IA criada por Felipe Hudson, de Belo Horizonte, Brasil), atendendo visitantes de um site.
 Responda no idioma do visitante, de forma curta, simpática e útil. Use Markdown simples. Não invente informações sobre a empresa do site: se não souber, diga e sugira o contato."""
@@ -362,6 +371,21 @@ async def dispatch_tool(user_id: str, name: str, args: dict):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
         return {"ok": True, "aberto": url}, {"type": "link", "link": {"url": url, "title": args.get("titulo") or url, "kind": "open"}}
+    if name == "controlar_computador":
+        devs = await db.desktop_devices.find({"user_id": user_id, "revoked": False}, {"_id": 0, "token_hash": 0}).sort("last_seen", -1).to_list(20)
+        if not devs:
+            return {"ok": False, "erro": "Nenhum computador pareado. Oriente o usuário a instalar o Adam Desktop em Extensões → Computador."}, None
+        want = (args.get("computador") or "").lower()
+        dev = next((d for d in devs if want and want in d["name"].lower()), devs[0])
+        task = (args.get("tarefa") or "").strip()[:4000]
+        t = {"id": str(uuid.uuid4()), "user_id": user_id, "device_id": dev["id"], "task": task, "status": "queued",
+             "logs": [dt_log("user", task)], "result": "", "session_id": "", "created_at": now()}
+        await db.desktop_tasks.insert_one(t)
+        online = dev.get("last_seen", "") > (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        return ({"ok": True, "computador": dev["name"], "online": online,
+                 "aviso": "A tarefa foi enviada. O usuário acompanha ao vivo no cartão abaixo e aprova cada ação no PC." +
+                          ("" if online else " O Adam Desktop parece fechado: peça para o usuário abri-lo.")},
+                {"type": "link", "link": {"url": "/extensoes?tab=pc", "title": task, "kind": "pc", "task_id": t["id"]}})
     return {"ok": False, "erro": "ferramenta desconhecida"}, None
 
 
@@ -1527,7 +1551,13 @@ async def desktop_finish(t: dict, status: str, message: str):
                                                          "$push": {"logs": dt_log("done" if status == "done" else status, message)}})
 
 
-async def desktop_reply(t: dict, r: dict) -> dict:
+async def desktop_save_screen(tid: str, screen: dict):
+    if screen.get("image"):
+        await db.desktop_tasks.update_one({"id": tid}, {"$set": {"screen": screen["image"][:3_000_000], "screen_at": now()}})
+
+
+async def desktop_reply(t: dict, r: dict, dev: dict) -> dict:
+    r["trusted"] = dev.get("trusted", [])
     if r["message"]:
         await db.desktop_tasks.update_one({"id": t["id"]}, {"$push": {"logs": dt_log("adam", r["message"])}})
     if r["done"]:
@@ -1585,7 +1615,39 @@ async def desktop_task_create(body: DesktopTaskIn, user: dict = Depends(require_
 
 @api.get("/desktop/tasks")
 async def desktop_tasks(user: dict = Depends(require_user)):
-    return await db.desktop_tasks.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(20)
+    return await db.desktop_tasks.find({"user_id": user["user_id"]}, {"_id": 0, "screen": 0}).sort("created_at", -1).to_list(20)
+
+
+@api.get("/desktop/tasks/{tid}")
+async def desktop_task_get(tid: str, user: dict = Depends(require_user)):
+    t = await db.desktop_tasks.find_one({"id": tid, "user_id": user["user_id"]}, {"_id": 0, "screen": 0})
+    if not t:
+        raise HTTPException(404, "Tarefa não encontrada")
+    return t
+
+
+@api.get("/desktop/tasks/{tid}/screen")
+async def desktop_task_screen(tid: str, user: dict = Depends(require_user)):
+    t = await db.desktop_tasks.find_one({"id": tid, "user_id": user["user_id"]}, {"_id": 0, "screen": 1, "screen_at": 1})
+    if not t:
+        raise HTTPException(404, "Tarefa não encontrada")
+    return {"image": t.get("screen") or "", "at": t.get("screen_at") or ""}
+
+
+class DesktopTrustedIn(BaseModel):
+    actions: List[str] = []
+
+
+DESKTOP_TRUSTABLE = ["abrir_site", "abrir", "ver_tela", "aguardar", "rolar", "mover_mouse", "clicar", "digitar", "tecla"]
+
+
+@api.put("/desktop/devices/{did}/trusted")
+async def desktop_device_trusted(did: str, body: DesktopTrustedIn, user: dict = Depends(require_user)):
+    acts = [a for a in DESKTOP_TRUSTABLE if a in body.actions]
+    r = await db.desktop_devices.update_one({"id": did, "user_id": user["user_id"], "revoked": False}, {"$set": {"trusted": acts}})
+    if not r.matched_count:
+        raise HTTPException(404, "Dispositivo não encontrado")
+    return {"trusted": acts}
 
 
 @api.post("/desktop/tasks/{tid}/stop")
@@ -1610,7 +1672,7 @@ async def desktop_stop_all(user: dict = Depends(require_user)):
 async def desktop_poll(dev: dict = Depends(require_device)):
     t = await db.desktop_tasks.find_one_and_update({"device_id": dev["id"], "status": "queued"}, {"$set": {"status": "running"}},
                                                    sort=[("created_at", 1)], projection={"_id": 0, "id": 1, "task": 1})
-    return {"device": dev["name"], "task": t}
+    return {"device": dev["name"], "task": t, "trusted": dev.get("trusted", [])}
 
 
 @api.get("/desktop/device/tasks/{tid}/status")
@@ -1640,7 +1702,8 @@ async def desktop_device_start(tid: str, body: DesktopStartIn, dev: dict = Depen
         await desktop_finish(t, "error", f"Falha no agente: {str(e)[:200]}")
         raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
     await db.desktop_tasks.update_one({"id": tid}, {"$set": {"session_id": r["session_id"]}})
-    return await desktop_reply(t, r)
+    await desktop_save_screen(tid, body.screen)
+    return await desktop_reply(t, r, dev)
 
 
 @api.post("/desktop/device/tasks/{tid}/step")
@@ -1652,6 +1715,7 @@ async def desktop_device_step(tid: str, body: AgentStepIn, dev: dict = Depends(r
     detail = res.get("error") or (str(res.get("output"))[:300] if res.get("output") else "")
     await db.desktop_tasks.update_one({"id": tid}, {"$push": {"logs": dt_log(
         "action", f"{a.get('name', '?')} {json.dumps(a.get('args', {}), ensure_ascii=False)[:300]} — {status}" + (f": {detail}" if detail else ""))}})
+    await desktop_save_screen(tid, res.get("screen") or {})
     if t["status"] != "running":
         return {"done": True, "stopped": True, "message": "Tarefa parada.", "action": None}
     try:
@@ -1663,7 +1727,22 @@ async def desktop_device_step(tid: str, body: AgentStepIn, dev: dict = Depends(r
         logger.exception("desktop step failed")
         await desktop_finish(t, "error", f"Falha no agente: {str(e)[:200]}")
         raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
-    return await desktop_reply(t, r)
+    return await desktop_reply(t, r, dev)
+
+
+INSTALLER = ROOT_DIR / "desktop_build" / "AdamSetup.exe"
+SRV_SLOT = b"ADAMSRV:" + b"X" * 8 + b" " * 292
+
+
+@api.get("/desktop/installer")
+async def desktop_installer(server: str, user: dict = Depends(require_user)):
+    if not server.startswith(("https://", "http://")) or len(server) > 290:
+        raise HTTPException(400, "Servidor inválido")
+    data = await asyncio.to_thread(INSTALLER.read_bytes)
+    slot = ("ADAMSRV:" + server.rstrip("/")).encode().ljust(len(SRV_SLOT))
+    data = data.replace(SRV_SLOT, slot, 1)
+    return Response(content=data, media_type="application/vnd.microsoft.portable-executable",
+                    headers={"Content-Disposition": 'attachment; filename="AdamSetup.exe"'})
 
 
 @api.get("/desktop/download")

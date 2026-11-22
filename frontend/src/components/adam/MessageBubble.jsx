@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState } from "react";
+import DesktopTaskCard from "@/components/adam/DesktopTaskCard";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -154,6 +155,7 @@ function LinkList({ links }) {
       {links.map((l, i) => {
         const k = LINK_KIND[l.kind] || LINK_KIND.read;
         const Icon = k.icon;
+        if (l.kind === "pc") return <DesktopTaskCard key={i} taskId={l.task_id} compact />;
         if (l.kind === "kb") return (
           <span key={i} data-testid={`message-link-kb-${i}`} className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/20 bg-white/[0.06] text-xs text-zinc-100">
             <Icon className="w-3.5 h-3.5" /><span className="text-zinc-500">{k.label}</span><span className="truncate max-w-[12rem]">{l.title}</span>

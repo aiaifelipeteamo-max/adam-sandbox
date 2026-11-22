@@ -19,7 +19,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 PERMS = HERE / "permissoes.json"
 LOG = HERE / "adam_log.txt"
-SERVER = (HERE / "server.txt").read_text(encoding="utf-8").strip().rstrip("/")
+SERVER = (HERE / "server.txt").read_text(encoding="utf-8").strip().removeprefix("ADAMSRV:").strip().rstrip("/")
 API = f"{SERVER}/api/desktop"
 OS = platform.system()
 MAX_W = 1280
@@ -27,6 +27,7 @@ NEVER_AUTO = {"executar_comando"}
 DEFAULT_PERMS = {
     "permitidas": ["clicar", "digitar", "tecla", "rolar", "mover_mouse", "abrir", "executar_comando", "ver_tela", "aguardar"],
     "sem_confirmacao": ["ver_tela", "aguardar"],
+    "aceitar_confiaveis_do_adam": True,
 }
 
 pyautogui.FAILSAFE = True
@@ -57,8 +58,19 @@ def load_json(p: Path, default: dict) -> dict:
         return default
 
 
+def ask_win(title: str, text: str, allow_all: bool) -> str:
+    import ctypes
+    if allow_all:
+        text += "\n\nSim = Permitir   ·   Não = Negar   ·   Cancelar = Permitir todas nesta tarefa"
+    flags = (0x3 if allow_all else 0x4) | 0x20 | 0x40000 | 0x10000
+    r = ctypes.windll.user32.MessageBoxW(0, text, title, flags)
+    return {6: "sim", 2: "todas"}.get(r, "nao")
+
+
 def ask(title: str, text: str, allow_all: bool) -> str:
     """Returns 'sim', 'nao' or 'todas'."""
+    if tk is None and OS == "Windows":
+        return ask_win(title, text, allow_all)
     if tk is None:
         opts = "[s]im / [n]ão" + (" / [t]odas nesta tarefa" if allow_all else "")
         r = input(f"\n{title}\n{text}\n{opts}: ").strip().lower()[:1]
@@ -107,6 +119,7 @@ class Agent:
             PERMS.write_text(json.dumps(DEFAULT_PERMS, indent=2, ensure_ascii=False), encoding="utf-8")
         self.perms = load_json(PERMS, DEFAULT_PERMS)
         self.scale = 1.0
+        self.trusted = []
         self.http = requests.Session()
 
     def h(self):
@@ -190,6 +203,12 @@ class Agent:
         shown = {k: v for k, v in a.items() if k != "motivo"}
         return f"Ação: {name}\nDetalhes: {json.dumps(shown, ensure_ascii=False)[:600]}\n\nMotivo: {a.get('motivo', '—')}"
 
+    def is_trusted(self, name: str, a: dict) -> bool:
+        if not self.perms.get("aceitar_confiaveis_do_adam", True):
+            return False
+        is_site = name == "abrir" and str(a.get("alvo", "")).startswith(("http://", "https://"))
+        return name in self.trusted or (is_site and "abrir_site" in self.trusted)
+
     def stopped(self, tid: str) -> bool:
         r = self.http.get(f"{API}/device/tasks/{tid}/status", headers=self.h(), timeout=30)
         return r.status_code != 200 or r.json().get("status") != "running"
@@ -207,6 +226,7 @@ class Agent:
         r = self.http.post(f"{API}/device/tasks/{tid}/start", headers=self.h(), json={"screen": self.screen()}, timeout=180).json()
         auto_all = False
         while r.get("action"):
+            self.trusted = r.get("trusted", self.trusted)
             act = r["action"]
             name, a = act["name"], act.get("args") or {}
             if r.get("message"):
@@ -216,7 +236,7 @@ class Agent:
                 result["denied"] = True
                 log(f"NEGADA (fora da lista permitida): {name} {a}")
             else:
-                auto = name not in NEVER_AUTO and (auto_all or name in self.perms.get("sem_confirmacao", []))
+                auto = name not in NEVER_AUTO and (auto_all or name in self.perms.get("sem_confirmacao", []) or self.is_trusted(name, a))
                 choice = "sim" if auto else ask("Adam — pedir permissão", self.describe(name, a), name not in NEVER_AUTO)
                 if choice == "todas":
                     auto_all = True
@@ -257,6 +277,7 @@ class Agent:
                     self.cfg = {}
                     self.pair()
                     continue
+                self.trusted = r.json().get("trusted", [])
                 t = r.json().get("task")
                 if t:
                     try:
