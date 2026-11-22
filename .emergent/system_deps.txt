@@ -1,1 +1,5 @@
 nsis=3.08-3+deb12u1
+python3-tk=3.11.2-3
+scrot=1.8.1-1
+wine64=8.0~repack-4
+xauth=1:1.1.2-1

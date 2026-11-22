@@ -11,6 +11,14 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+import traceback
+
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except Exception:
+    pass
+
 import pyautogui
 import pyperclip
 import requests
@@ -121,25 +129,40 @@ class Agent:
         self.scale = 1.0
         self.trusted = []
         self.http = requests.Session()
+        self.http.headers["User-Agent"] = f"AdamDesktop/1.1 ({OS})"
 
     def h(self):
         return {"X-Device-Token": self.cfg.get("token", "")}
 
     def pair(self):
         while not self.cfg.get("token"):
-            code = ask_code()
+            code = "".join(c for c in ask_code() if c.isdigit())
             if not code:
-                sys.exit("Pareamento cancelado.")
-            r = self.http.post(f"{API}/pair", json={"code": code, "name": platform.node() or "Meu PC", "os": f"{OS} {platform.release()}"}, timeout=30)
-            if r.status_code != 200:
-                log(f"Falha no pareamento: {r.json().get('detail', r.text)}")
+                print("Digite apenas os 6 números do código.")
                 continue
-            self.cfg = {"token": r.json()["token"], "device_id": r.json()["device_id"]}
+            try:
+                r = self.http.post(f"{API}/pair", json={"code": code, "name": platform.node() or "Meu PC", "os": f"{OS} {platform.release()}"}, timeout=30)
+            except Exception as e:
+                log(f"Não consegui falar com o Adam em {SERVER}: {e.__class__.__name__}: {e}")
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                log(f"Resposta inesperada do servidor (HTTP {r.status_code}): {r.text[:200]}")
+                continue
+            if r.status_code != 200:
+                log(f"Falha no pareamento: {data.get('detail', r.text[:200])}")
+                continue
+            self.cfg = {"token": data["token"], "device_id": data["device_id"]}
             CONFIG.write_text(json.dumps(self.cfg), encoding="utf-8")
-            log(f"Pareado como '{r.json()['name']}'.")
+            log(f"Pareado como '{data['name']}'. Pronto! Volte ao Adam no navegador.")
 
     def screen(self) -> dict:
-        img = pyautogui.screenshot()
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab()
+        except Exception:
+            img = pyautogui.screenshot()
         w, h = img.size
         self.scale = w / MAX_W if w > MAX_W else 1.0
         if self.scale != 1.0:
@@ -288,6 +311,11 @@ class Agent:
                         log("PARADA DE EMERGÊNCIA: mouse no canto da tela.")
                         self.http.post(f"{API}/device/tasks/{t['id']}/reject", headers=self.h(), json={"reason": "failsafe"}, timeout=30)
                         time.sleep(3)
+                    except requests.RequestException:
+                        raise
+                    except Exception as e:
+                        log(f"ERRO na tarefa: {e.__class__.__name__}: {e}")
+                        self.http.post(f"{API}/device/tasks/{t['id']}/reject", headers=self.h(), timeout=30)
             except requests.RequestException as e:
                 log(f"Sem conexão com o Adam ({e.__class__.__name__}). Tentando de novo…")
                 time.sleep(5)
@@ -296,6 +324,10 @@ class Agent:
 
 if __name__ == "__main__":
     try:
+        log(f"Adam Desktop iniciando (servidor: {SERVER})")
         Agent().loop()
     except KeyboardInterrupt:
         log("Adam Desktop encerrado pelo usuário.")
+    except BaseException:
+        log("ERRO inesperado:\n" + traceback.format_exc())
+        input("\nO Adam Desktop parou por causa do erro acima (também salvo em adam_log.txt). Pressione Enter para fechar.")
