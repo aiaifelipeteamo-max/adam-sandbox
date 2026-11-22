@@ -33,7 +33,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 try:
     from backend.clerk_auth import clerk_router, require_user
-    from backend import storage, files_util, web_tools, browser_agent, code_agent
+    from backend import storage, files_util, web_tools, browser_agent, code_agent, desktop_agent
     from backend.neural import engine as neural
 except ModuleNotFoundError:
     from clerk_auth import clerk_router, require_user
@@ -42,6 +42,7 @@ except ModuleNotFoundError:
     import web_tools
     import browser_agent
     import code_agent
+    import desktop_agent
     from neural import engine as neural
 
 mongo_url = os.environ["MONGO_URL"]
@@ -1483,6 +1484,211 @@ async def vscode_download(server: str, user: dict = Depends(require_user)):
                 z.write(p, f"extension/{p.relative_to(src).as_posix()}")
     return Response(content=buf.getvalue(), media_type="application/octet-stream",
                     headers={"Content-Disposition": 'attachment; filename="adam-vscode.vsix"'})
+
+# ---------- Routes: desktop agent (local PC program) ----------
+class DesktopPairIn(BaseModel):
+    code: str
+    name: str = "Meu PC"
+    os: str = ""
+
+
+class DesktopTaskIn(BaseModel):
+    device_id: str
+    task: str = Field(min_length=1, max_length=4000)
+
+
+class DesktopStartIn(BaseModel):
+    screen: dict = {}
+
+
+def dt_log(kind: str, text: str) -> dict:
+    return {"t": now(), "kind": kind, "text": str(text)[:2000]}
+
+
+async def require_device(request: Request) -> dict:
+    raw = request.headers.get("x-device-token", "")
+    dev = await db.desktop_devices.find_one({"token_hash": hash_key(raw), "revoked": False}, {"_id": 0}) if raw.startswith("adamdev_") else None
+    if not dev:
+        raise HTTPException(401, "Dispositivo não pareado ou revogado")
+    await db.desktop_devices.update_one({"id": dev["id"]}, {"$set": {"last_seen": now()}})
+    return dev
+
+
+async def device_task(tid: str, dev: dict) -> dict:
+    t = await db.desktop_tasks.find_one({"id": tid, "device_id": dev["id"]}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Tarefa não encontrada")
+    return t
+
+
+async def desktop_finish(t: dict, status: str, message: str):
+    desktop_agent.stop(t.get("session_id") or "")
+    await db.desktop_tasks.update_one({"id": t["id"]}, {"$set": {"status": status, "result": message, "finished_at": now()},
+                                                         "$push": {"logs": dt_log("done" if status == "done" else status, message)}})
+
+
+async def desktop_reply(t: dict, r: dict) -> dict:
+    if r["message"]:
+        await db.desktop_tasks.update_one({"id": t["id"]}, {"$push": {"logs": dt_log("adam", r["message"])}})
+    if r["done"]:
+        await desktop_finish(t, "done", r["message"])
+    return r
+
+
+@api.post("/desktop/pair-code")
+async def desktop_pair_code(user: dict = Depends(require_user)):
+    code = f"{secrets.randbelow(10**6):06d}"
+    await db.desktop_pair_codes.insert_one({"code": code, "user_id": user["user_id"],
+                                            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()})
+    return {"code": code, "expires_in": 600}
+
+
+@api.post("/desktop/pair")
+async def desktop_pair(body: DesktopPairIn, request: Request):
+    ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if not rate_ok(f"pair:{ip}"):
+        raise HTTPException(429, "Muitas tentativas. Aguarde um minuto.")
+    rec = await db.desktop_pair_codes.find_one_and_delete({"code": body.code.strip(), "expires_at": {"$gt": now()}})
+    if not rec:
+        raise HTTPException(400, "Código inválido ou expirado. Gere um novo no Adam.")
+    token = "adamdev_" + secrets.token_urlsafe(32)
+    dev = {"id": str(uuid.uuid4()), "user_id": rec["user_id"], "name": body.name[:60] or "Meu PC", "os": body.os[:60],
+           "token_hash": hash_key(token), "revoked": False, "created_at": now(), "last_seen": now()}
+    await db.desktop_devices.insert_one(dev)
+    return {"token": token, "device_id": dev["id"], "name": dev["name"]}
+
+
+@api.get("/desktop/devices")
+async def desktop_devices(user: dict = Depends(require_user)):
+    return await db.desktop_devices.find({"user_id": user["user_id"], "revoked": False}, {"_id": 0, "token_hash": 0}).sort("created_at", -1).to_list(50)
+
+
+@api.delete("/desktop/devices/{did}")
+async def desktop_device_delete(did: str, user: dict = Depends(require_user)):
+    r = await db.desktop_devices.update_one({"id": did, "user_id": user["user_id"]}, {"$set": {"revoked": True}})
+    if not r.matched_count:
+        raise HTTPException(404, "Dispositivo não encontrado")
+    await db.desktop_tasks.update_many({"device_id": did, "status": {"$in": ["queued", "running"]}}, {"$set": {"status": "stopped"}})
+    return {"ok": True}
+
+
+@api.post("/desktop/tasks")
+async def desktop_task_create(body: DesktopTaskIn, user: dict = Depends(require_user)):
+    if not await db.desktop_devices.find_one({"id": body.device_id, "user_id": user["user_id"], "revoked": False}):
+        raise HTTPException(404, "Dispositivo não encontrado")
+    t = {"id": str(uuid.uuid4()), "user_id": user["user_id"], "device_id": body.device_id, "task": body.task.strip(),
+         "status": "queued", "logs": [dt_log("user", body.task.strip())], "result": "", "session_id": "", "created_at": now()}
+    await db.desktop_tasks.insert_one(t)
+    t.pop("_id", None)
+    return t
+
+
+@api.get("/desktop/tasks")
+async def desktop_tasks(user: dict = Depends(require_user)):
+    return await db.desktop_tasks.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(20)
+
+
+@api.post("/desktop/tasks/{tid}/stop")
+async def desktop_task_stop(tid: str, user: dict = Depends(require_user)):
+    t = await db.desktop_tasks.find_one({"id": tid, "user_id": user["user_id"]}, {"_id": 0})
+    if not t:
+        raise HTTPException(404, "Tarefa não encontrada")
+    if t["status"] in ("queued", "running"):
+        await desktop_finish(t, "stopped", "Parada pelo usuário (botão de emergência).")
+    return {"ok": True}
+
+
+@api.post("/desktop/stop-all")
+async def desktop_stop_all(user: dict = Depends(require_user)):
+    tasks = await db.desktop_tasks.find({"user_id": user["user_id"], "status": {"$in": ["queued", "running"]}}, {"_id": 0}).to_list(50)
+    for t in tasks:
+        await desktop_finish(t, "stopped", "Parada pelo usuário (botão de emergência).")
+    return {"stopped": len(tasks)}
+
+
+@api.get("/desktop/device/poll")
+async def desktop_poll(dev: dict = Depends(require_device)):
+    t = await db.desktop_tasks.find_one_and_update({"device_id": dev["id"], "status": "queued"}, {"$set": {"status": "running"}},
+                                                   sort=[("created_at", 1)], projection={"_id": 0, "id": 1, "task": 1})
+    return {"device": dev["name"], "task": t}
+
+
+@api.get("/desktop/device/tasks/{tid}/status")
+async def desktop_device_status(tid: str, dev: dict = Depends(require_device)):
+    return {"status": (await device_task(tid, dev))["status"]}
+
+
+@api.post("/desktop/device/tasks/{tid}/reject")
+async def desktop_device_reject(tid: str, dev: dict = Depends(require_device)):
+    t = await device_task(tid, dev)
+    if t["status"] in ("queued", "running"):
+        await desktop_finish(t, "stopped", "Recusada ou parada no computador.")
+    return {"ok": True}
+
+
+@api.post("/desktop/device/tasks/{tid}/start")
+async def desktop_device_start(tid: str, body: DesktopStartIn, dev: dict = Depends(require_device)):
+    t = await device_task(tid, dev)
+    if t["status"] != "running":
+        return {"done": True, "stopped": True, "message": "Tarefa parada.", "action": None}
+    mems = await db.memories.find({"user_id": dev["user_id"]}, {"_id": 0, "fact": 1}).to_list(30)
+    ctx = ("\n\nFatos sobre o usuário:\n" + "\n".join(f"- {m['fact']}" for m in mems)) if mems else ""
+    try:
+        r = await desktop_agent.start(LLM_KEY, PRO_MODEL, dev["user_id"], t["task"], body.screen, ctx)
+    except Exception as e:
+        logger.exception("desktop start failed")
+        await desktop_finish(t, "error", f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
+    await db.desktop_tasks.update_one({"id": tid}, {"$set": {"session_id": r["session_id"]}})
+    return await desktop_reply(t, r)
+
+
+@api.post("/desktop/device/tasks/{tid}/step")
+async def desktop_device_step(tid: str, body: AgentStepIn, dev: dict = Depends(require_device)):
+    t = await device_task(tid, dev)
+    res = body.result or {}
+    a = res.get("action") or {}
+    status = "negada" if res.get("denied") else "erro" if res.get("error") else "executada"
+    detail = res.get("error") or (str(res.get("output"))[:300] if res.get("output") else "")
+    await db.desktop_tasks.update_one({"id": tid}, {"$push": {"logs": dt_log(
+        "action", f"{a.get('name', '?')} {json.dumps(a.get('args', {}), ensure_ascii=False)[:300]} — {status}" + (f": {detail}" if detail else ""))}})
+    if t["status"] != "running":
+        return {"done": True, "stopped": True, "message": "Tarefa parada.", "action": None}
+    try:
+        r = await desktop_agent.step(t["session_id"], dev["user_id"], body.tool_call_id, res)
+    except KeyError as e:
+        await desktop_finish(t, "error", str(e))
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.exception("desktop step failed")
+        await desktop_finish(t, "error", f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
+    return await desktop_reply(t, r)
+
+
+@api.get("/desktop/download")
+async def desktop_download(server: str, user: dict = Depends(require_user)):
+    import io
+    import zipfile
+    if not server.startswith(("https://", "http://")):
+        raise HTTPException(400, "Servidor inválido")
+    buf = io.BytesIO()
+    src = ROOT_DIR / "desktop"
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in src.rglob("*"):
+            if p.is_file() and "__pycache__" not in p.parts:
+                arc = f"adam-desktop/{p.relative_to(src).as_posix()}"
+                if p.suffix in (".bat", ".txt"):
+                    z.writestr(arc, p.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n"))
+                elif p.suffix == ".sh":
+                    info = zipfile.ZipInfo(arc)
+                    info.external_attr = 0o755 << 16
+                    z.writestr(info, p.read_bytes())
+                else:
+                    z.write(p, arc)
+        z.writestr("adam-desktop/server.txt", server.rstrip("/"))
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="adam-desktop.zip"'})
 
 
 app.include_router(api)

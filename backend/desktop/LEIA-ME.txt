@@ -1,0 +1,15 @@
+ADAM DESKTOP - o Adam no seu computador
+
+1. Windows: dê dois cliques em Iniciar-Adam.bat (na primeira vez ele instala o que precisa).
+   macOS/Linux: rode ./iniciar.sh no terminal (precisa de Python 3; no Linux, também python3-tk).
+2. No Adam (navegador), vá em Extensões -> Computador, clique em "Gerar código" e digite o código aqui.
+3. Mande tarefas pelo Adam. Este programa mostra cada ação e só executa se você clicar em Permitir.
+
+Segurança:
+- permissoes.json: "permitidas" = ações que o Adam pode pedir; "sem_confirmacao" = ações sem perguntar.
+  executar_comando SEMPRE pede confirmação.
+- adam_log.txt: registro de tudo que foi pedido, permitido, negado e executado.
+- Parada de emergência: leve o mouse ao canto superior esquerdo da tela, feche esta janela (Ctrl+C)
+  ou clique em "Parar tudo" no Adam.
+- Para desconectar este PC: remova-o em Extensões -> Computador (ou apague config.json).
+- macOS: permita Acessibilidade e Gravação de Tela para o Terminal em Ajustes do Sistema -> Privacidade.

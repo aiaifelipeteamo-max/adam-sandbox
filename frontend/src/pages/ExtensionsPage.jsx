@@ -1,12 +1,13 @@
 import { useSearchParams } from "react-router-dom";
 import VSCodePage from "@/pages/VSCodePage";
 import ExtensionPage from "@/pages/ExtensionPage";
+import DesktopPage from "@/pages/DesktopPage";
 
-const TABS = [["vscode", "VS Code"], ["chrome", "Chrome"]];
+const TABS = [["vscode", "VS Code"], ["chrome", "Chrome"], ["pc", "Computador"]];
 
 export default function ExtensionsPage() {
   const [params, setParams] = useSearchParams();
-  const tab = params.get("tab") === "chrome" ? "chrome" : "vscode";
+  const tab = ["chrome", "pc"].includes(params.get("tab")) ? params.get("tab") : "vscode";
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       <div className="shrink-0 pl-14 md:pl-8 pr-5 pt-4 flex items-center gap-4">
@@ -18,7 +19,7 @@ export default function ExtensionsPage() {
           ))}
         </div>
       </div>
-      {tab === "vscode" ? <VSCodePage /> : <ExtensionPage />}
+      {tab === "vscode" ? <VSCodePage /> : tab === "chrome" ? <ExtensionPage /> : <DesktopPage />}
     </div>
   );
 }
