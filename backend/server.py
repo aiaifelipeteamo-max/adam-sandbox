@@ -991,7 +991,7 @@ async def voice_transcribe(file: UploadFile = File(...), user: dict = Depends(re
                                                                prompt="Adam, Felipe Hudson, Belo Horizonte.")
     except Exception as e:
         logger.exception("transcribe failed")
-        raise HTTPException(502, f"Falha na transcrição: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha na transcrição: {str(e)[:200]}")
     return {"text": res.text.strip()}
 
 
@@ -1014,10 +1014,41 @@ async def eleven_shared_voices(gender: str = "") -> list:
             for v in r.json().get("voices", [])]
 
 
+async def eleven_is_free() -> bool:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(f"{ELEVEN_API}/v1/user/subscription", headers={"xi-api-key": eleven_key()})
+    return r.status_code != 200 or r.json().get("tier") == "free"
+
+
+async def eleven_premade_voices() -> list:
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(f"{ELEVEN_API}/v1/voices", headers={"xi-api-key": eleven_key()})
+    r.raise_for_status()
+    return [{"voice_id": v["voice_id"], "public_owner_id": "", "name": v["name"], "gender": (v.get("labels") or {}).get("gender"),
+             "age": (v.get("labels") or {}).get("age"), "description": (v.get("description") or "")[:140], "preview_url": v.get("preview_url")}
+            for v in r.json().get("voices", []) if v.get("category") == "premade"]
+
+
+def eleven_error_msg(e: Exception) -> str:
+    txt = e.response.text if isinstance(e, httpx.HTTPStatusError) else str(e)
+    if "voices_write" in txt or "missing_permissions" in txt:
+        return "A chave da ElevenLabs não tem a permissão 'voices_write'. Ative-a na chave ou use uma voz padrão."
+    if "paid_plan_required" in txt or "Free users" in txt:
+        return "O plano gratuito da ElevenLabs não permite vozes da biblioteca pela API. Use uma voz padrão."
+    return f"ElevenLabs: {txt[:200]}"
+
+
 async def eleven_ensure_voice(user_id: str, st: dict) -> str:
     """Returns a usable ElevenLabs voice_id; adds a Brazilian voice from the library to the account if needed."""
     if st.get("eleven_voice_id"):
         return st["eleven_voice_id"]
+    if await eleven_is_free():
+        voices = await eleven_premade_voices()
+        if not voices:
+            raise RuntimeError("Nenhuma voz padrão encontrada")
+        vid = voices[0]["voice_id"]
+        await db.settings.update_one({"user_id": user_id}, {"$set": {"eleven_voice_id": vid, "eleven_voice_name": voices[0]["name"]}}, upsert=True)
+        return vid
     voices = await eleven_shared_voices("male")
     if not voices:
         raise RuntimeError("Nenhuma voz brasileira encontrada")
@@ -1052,23 +1083,25 @@ async def eleven_voices(user: dict = Depends(require_user)):
     if not eleven_key():
         return {"enabled": False, "voices": []}
     try:
+        if await eleven_is_free():
+            return {"enabled": True, "free": True, "voices": await eleven_premade_voices()}
         return {"enabled": True, "voices": await eleven_shared_voices()}
     except Exception as e:
-        raise HTTPException(502, f"ElevenLabs: {str(e)[:200]}")
+        raise HTTPException(400, eleven_error_msg(e))
 
 
 class ElevenPickIn(BaseModel):
     voice_id: str
-    public_owner_id: str
+    public_owner_id: str = ""
     name: str
 
 
 @api.post("/voice/eleven/select")
 async def eleven_select(body: ElevenPickIn, user: dict = Depends(require_user)):
     try:
-        vid = await eleven_add_shared(body.public_owner_id, body.voice_id, body.name)
+        vid = await eleven_add_shared(body.public_owner_id, body.voice_id, body.name) if body.public_owner_id else body.voice_id
     except Exception as e:
-        raise HTTPException(502, f"ElevenLabs: {str(e)[:200]}")
+        raise HTTPException(400, eleven_error_msg(e))
     await db.settings.update_one({"user_id": user["user_id"]}, {"$set": {"eleven_voice_id": vid, "eleven_voice_name": body.name,
                                                                           "voice_provider": "elevenlabs"}}, upsert=True)
     return {"voice_id": vid, "name": body.name}
@@ -1090,7 +1123,7 @@ async def voice_speak(body: SpeakIn, user: dict = Depends(require_user)):
         audio = await OpenAITextToSpeech(api_key=LLM_KEY).generate_speech(text=text, model="tts-1", voice=body.voice or st.get("voice") or "onyx")
     except Exception as e:
         logger.exception("tts failed")
-        raise HTTPException(502, f"Falha ao gerar voz: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha ao gerar voz: {str(e)[:200]}")
     return Response(content=audio, media_type="audio/mpeg", headers={"X-Voice-Provider": "openai"})
 
 
@@ -1204,7 +1237,7 @@ async def agent_start(body: AgentStartIn, request: Request):
         return await browser_agent.start(LLM_KEY, PRO_MODEL, user["user_id"], body.task, body.page, ctx)
     except Exception as e:
         logger.exception("agent start failed")
-        raise HTTPException(502, f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
 
 
 @api.post("/v1/agent/{sid}/step")
@@ -1216,7 +1249,7 @@ async def agent_step(sid: str, body: AgentStepIn, request: Request):
         raise HTTPException(404, str(e))
     except Exception as e:
         logger.exception("agent step failed")
-        raise HTTPException(502, f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
 
 
 @api.post("/v1/agent/{sid}/stop")
@@ -1375,7 +1408,7 @@ async def code_start(body: CodeStartIn, request: Request):
         return await code_agent.start(LLM_KEY, PRO_MODEL, user["user_id"], body.task, body.context, body.session_id, ctx, body.system, body.tools)
     except Exception as e:
         logger.exception("code agent start failed")
-        raise HTTPException(502, f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
 
 
 @api.post("/v1/code/{sid}/step")
@@ -1387,7 +1420,7 @@ async def code_step(sid: str, body: AgentStepIn, request: Request):
         raise HTTPException(404, str(e))
     except Exception as e:
         logger.exception("code agent step failed")
-        raise HTTPException(502, f"Falha no agente: {str(e)[:200]}")
+        raise HTTPException(500, f"Falha no agente: {str(e)[:200]}")
 
 
 @api.post("/v1/code/{sid}/stop")

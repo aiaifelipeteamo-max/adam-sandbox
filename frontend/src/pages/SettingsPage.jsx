@@ -15,14 +15,16 @@ function BrazilianVoices({ current, onPicked }) {
   useEffect(() => { api.get("/voice/eleven/voices").then((r) => setData(r.data)).catch((e) => setData({ enabled: true, voices: [], error: errMsg(e) })); }, [api]);
   if (!data) return <p className="text-xs text-zinc-500 mb-4">Carregando vozes brasileiras…</p>;
   if (!data.enabled) return <p className="text-xs text-zinc-100 mb-4" data-testid="eleven-missing-key">Chave da ElevenLabs ainda não configurada — usando a voz OpenAI enquanto isso.</p>;
-  if (data.error) return <p className="text-xs text-rose-300 mb-4">{data.error}</p>;
+  if (data.error) return <p className="text-xs text-rose-300 mb-4" data-testid="eleven-error">{data.error}</p>;
+  const freeNote = data.free && <p className="text-xs text-zinc-400 mb-2" data-testid="eleven-free-note">Plano gratuito da ElevenLabs: mostrando as vozes padrão (todas falam português). Vozes brasileiras da biblioteca exigem plano pago.</p>;
   const pick = async (v) => {
     setBusy(v.voice_id);
     try { const { data: d } = await api.post("/voice/eleven/select", v); onPicked(d); toast.success(`Voz “${v.name}” selecionada`); }
     catch (e) { toast.error(errMsg(e)); }
     setBusy(null);
   };
-  return (
+  return (<>
+    {freeNote}
     <div className="grid sm:grid-cols-2 gap-2 mb-4 max-h-80 overflow-y-auto scroll-thin pr-1" data-testid="eleven-voice-list">
       {data.voices.map((v) => (
         <div key={v.voice_id} className={`p-3 rounded-xl border ${current === v.voice_id ? "border-white/20 bg-white/[0.06]" : "border-white/10 bg-white/[0.02]"}`}>
@@ -39,7 +41,7 @@ function BrazilianVoices({ current, onPicked }) {
         </div>
       ))}
     </div>
-  );
+  </>);
 }
 
 function GithubConnect() {
